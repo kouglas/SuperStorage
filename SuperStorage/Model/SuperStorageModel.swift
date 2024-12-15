@@ -36,13 +36,16 @@ import Foundation
 class SuperStorageModel: ObservableObject {
   /// The list of currently running downloads.
   @Published var downloads: [DownloadInfo] = []
-
+  
+  /// allows jpeg image formats to be partially downloaded 
+  @TaskLocal static var supportPartialDownloads = false
+  
   /// Downloads a file and returns its content.
   func download(file: DownloadFile) async throws -> Data {
     guard let url = URL(string: "http://localhost:8080/files/download?\(file.name)") else {
       throw "Could not create the URL."
     }
-  await addDownload(name: file.name)
+    await addDownload(name: file.name)
     
     let (data, response) = try await URLSession.shared.data(from: url, delegate: nil)
     await updateDownload(name: file.name, progress: 1.0)
@@ -52,21 +55,54 @@ class SuperStorageModel: ObservableObject {
     }
     return data
   }
-
+  
   /// Downloads a file, returns its data, and updates the download progress in ``downloads``.
   func downloadWithProgress(file: DownloadFile) async throws -> Data {
     return try await downloadWithProgress(fileName: file.name, name: file.name, size: file.size)
   }
-
+  
   /// Downloads a file, returns its data, and updates the download progress in ``downloads``.
   private func downloadWithProgress(fileName: String, name: String, size: Int, offset: Int? = nil) async throws -> Data {
     guard let url = URL(string: "http://localhost:8080/files/download?\(fileName)") else {
       throw "Could not create the URL."
     }
     await addDownload(name: name)
-    return Data()
+    let result: (downloadStream: URLSession.AsyncBytes, response: URLResponse)
+    
+    if let offset = offset {
+      let urlRequest = URLRequest(url: url, offset: offset, length: size)
+      result = try await URLSession.shared.bytes(for: urlRequest, delegate: nil)
+      
+      guard (result.response as? HTTPURLResponse)?.statusCode == 206 else {
+        throw "The server responded with an error "
+      }
+    } else {
+      result = try await URLSession.shared.bytes(from: url, delegate: nil)
+      
+      guard (result.response as? HTTPURLResponse)?.statusCode == 200 else {
+        throw "The server responded with an error"
+      }
+    }
+    var asyncDownloadIterator = result.downloadStream.makeAsyncIterator()
+    var accumulator = ByteAccumulator(name: name, size: size)
+    
+    while await !stopDownloads, !accumulator.checkCompleted() {
+      while !accumulator.isBatchCompleted,
+            let byte = try await asyncDownloadIterator.next() {
+        accumulator.append(byte)
+      }
+      let progress = accumulator.progress
+      Task.detached(priority: .medium) {
+        await self.updateDownload(name: name, progress: progress)
+      }
+      print(accumulator.description)
+    }
+    if await stopDownloads, !Self.supportPartialDownloads {
+      throw CancellationError()
+    }
+    return accumulator.data
   }
-
+  
   /// Downloads a file using multiple concurrent connections, returns the final content, and updates the download progress.
   func multiDownloadWithProgress(file: DownloadFile) async throws -> Data {
     func partInfo(index: Int, of count: Int) -> (offset: Int, size: Int, name: String) {
@@ -78,13 +114,19 @@ class SuperStorageModel: ObservableObject {
     }
     let total = 4
     let parts = (0..<total).map { partInfo(index: $0, of: total) }
+    
+    async let part1 = downloadWithProgress(fileName: file.name, name: parts[0].name, size: parts[0].size, offset: parts[0].offset)
+    async let part2 = downloadWithProgress(fileName: file.name, name: parts[1].name, size: parts[1].size, offset: parts[1].offset)
+    async let part3 = downloadWithProgress(fileName: file.name, name: parts[2].name, size: parts[2].size, offset: parts[2].offset)
+    async let part4 = downloadWithProgress(fileName: file.name, name: parts[3].name, size: parts[3].size, offset: parts[3].offset)
     // Add challenge code here.
-    return Data()
+    return try await [part1, part2, part3, part4]
+      .reduce(Data(), +)
   }
-
+  
   /// Flag that stops ongoing downloads.
   @MainActor var stopDownloads = false
-
+  
   @MainActor func reset() {
     stopDownloads = false
     downloads.removeAll()
@@ -97,7 +139,7 @@ extension SuperStorageModel {
     let downloadInfo = DownloadInfo(id: UUID(), name: name, progress: 0.0)
     downloads.append(downloadInfo)
   }
-
+  
   /// Updates a the progress of a given download.
   @MainActor func updateDownload(name: String, progress: Double) {
     if let index = downloads.firstIndex(where: { $0.name == name }) {
@@ -121,7 +163,7 @@ extension SuperStorageModel {
       throw "The server response was not recognized."
     }
     
-    return list 
+    return list
     
   }
   
